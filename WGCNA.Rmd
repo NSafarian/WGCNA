@@ -1,0 +1,476 @@
+---
+title: "Weighted correlation network analysis (WGCNA)"
+author: "Nickie Safarian"
+date: '2022-05-02'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Weighted correlation network analysis (WGCNA)
+## Purpose of analysis
+
+In this script, I use weighted gene co-expression network analysis (WGCNA) to identify co-expressed gene modules. The aim is to identify sets of genes that are expressed together across major psychological disorders (or ethcnicity groups) presented in *Common Mind Datasets (CMC)*.  
+
+## Install libraries
+```{r}
+if (!("DESeq2" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("DESeq2", update = FALSE)
+}
+
+if (!("impute" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("impute")
+}
+
+if (!("WGCNA" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("WGCNA")
+}
+
+if (!("ggforce" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ggforce")
+}
+
+#Additional notes
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# or simply do install.packages("BiocManager")
+BiocManager::install("ComplexHeatmap")
+BiocManager::install("limma")
+
+```
+
+## Attach/Load libraries
+```{r message=FALSE}
+
+library(DESeq2)
+library(magrittr)
+library(WGCNA)
+library(ggplot2)
+library(tidyverse)
+library(Seurat)
+library(ComplexHeatmap)
+library(limma)
+
+# to look which libraries are loaded use : search()
+```
+
+## Import the datasets
+```{r}
+# Read in metadata RDS file
+metadata <- readRDS("/Users/nickie/Documents/Rdirectory/CAMH/WGCNA_Projects/3_Keon'sdata_practice/CMC_data/METADATA.rds")
+
+colnames(metadata)[1] <- "SampleID"
+
+# Read in counts data RDS file
+counts <- readRDS("/Users/nickie/DOcuments/Rdirectory/CAMH/WGCNA_Projects/3_Keon'sdata_practice/CMC_data/geneCountsMerged.rds") # already the column_to_rownames("Gene") is executed and the rownames are the genes name, so no changes here is required
+
+#check the data
+head(metadata)
+head(df)
+
+
+# We need to remove "(Multiracial)" from Ethnicity variable which only has one observation {It is a Female from 'Penn' Institution, 'MSSM-Penn-Pitt' Cohort, with SampleID of `PENN_RNA_PFC_16`}
+
+metadata <- metadata %>% subset (!Ethnicity %in% "(Multiracial)")
+
+counts <- counts %>% subset(select = -PENN_RNA_PFC_16)
+
+```
+
+## Let's ensure that the metadata and counts data are in the same sample order.
+```{r}
+
+# Make the data in the order of the metadata
+counts <- counts %>%
+  dplyr::select(metadata$SampleID)
+
+# Check if this is in the same order
+all.equal(colnames(counts), metadata$SampleID)
+
+
+```
+
+## Prepare count data for `DESeq2`
+There are two things we need to do to prep our expression data for DESeq2. 
+
+_1_ convert all of the values in the data to integers 
+_2_ filter out low expression counts
+
+```{r}
+# The next DESeq2 functions need the values to be converted to integers
+counts <- round(counts) %>%
+  # The next steps require a data frame and round() returns a matrix
+  as.data.frame() %>%
+  # Only keep rows that have total counts above the cutoff
+  dplyr::filter(rowSums(.) >= 50)
+
+```
+
+## Set up main experimental grouping variable in the metadata
+```{r}
+
+#Choose variables or configure new variables to do the analysis for 
+
+# in CMC data we'll be working on two variables 1-Diagnosis, 2-Ethnicity. Both should be set up as factor
+
+metadata$Dx  = as.factor(metadata$Dx)
+metadata$Ethnicity = as.factor(metadata$Ethnicity)
+
+# ? another variable to consider
+metadata$Institution = as.factor(metadata$Institution) 
+
+```
+
+Let's double check that our factor set up is right. 
+We want `acute illness` to be the first level since it was the first time point collected. 
+## Check/Correct the levels of factors/variables
+```{r}
+
+# level the factors as required, for instance, set the control group as level 1 and other groups to be next...
+
+levels(metadata$Ethnicity) #"African-American", "Asian","Caucasian" ,"Hispanic"    # here everything will be compared by having 'African-American' as control group.
+
+levels(metadata$Dx) # "Control" "SCZ"     "BP"  
+levels(metadata$Institution) #"MSSM", "NIMH-HBCC", "Penn",  "Pitt"   
+
+```
+
+## Create a DESeqDataset
+```{r}
+# Create a `DESeqDataSet` object
+dds <- DESeqDataSetFromMatrix(
+  countData = counts, # Our prepped data frame with counts
+  colData = metadata, # Data frame with annotation for our samples
+  design = ~1 # Here we are not specifying a model, you may use somw variables instead
+)
+
+```
+
+## Perform DESeq2 normalization and transformation (using `vst())
+```{r}
+
+dds_norm <- vst(dds)
+
+```
+
+## Format normalized data for WGCNA
+```{r}
+# Retrieve the normalized data from the `DESeqDataSet`
+normalized_counts <- assay(dds_norm) %>%
+  t() # Transpose this data so we can pass it to WGCNA 
+```
+
+## Determine parameters for WGCNA
+To identify which genes are in the same modules, WGCNA first creates a weighted network to define which genes are near each other. 
+The measure of "adjacency" it uses is based on the correlation matrix, but requires the definition of a threshold value, which in turn depends on a "power" parameter that defines the exponent used when transforming the correlation values. 
+The choice of power parameter will affect the number of modules identified, and the WGCNA modules provides the  `pickSoftThreshold()` function to help identify good choices for this parameter. 
+
+```{r}
+sft <- pickSoftThreshold(normalized_counts,
+  dataIsExpr = TRUE,
+  corFnc = cor,
+  networkType = "signed"
+)
+```
+
+This `sft` object has a lot of information, we will want to plot some of it to figure out what our `power` soft-threshold should be. 
+We have to first calculate a measure of the model fit, the signed $R^2$, and make that a new variable. 
+
+```{r}
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+
+```
+
+Now, let's plot the model fitting by the `power` soft threshold so we can decide on a soft-threshold for power. 
+
+```{r}
+ggplot(sft_df, aes(x = Power, y = model_fit, label = Power)) +
+  # Plot the points
+  geom_point() +
+  # We'll put the Power labels slightly above the data points
+  geom_text(nudge_y = 0.1) +
+  # We will plot what WGCNA recommends as an R^2 cutoff
+  geom_hline(yintercept = 0.80, col = "red") +
+  # Just in case our values are low, we want to make sure we can still see the 0.80 level
+  ylim(c(min(sft_df$model_fit), 1.05)) +
+  # We can add more sensible labels for our axis
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit, signed R^2") +
+  ggtitle("Scale independence") +
+  # This adds some nicer aesthetics to our plot
+  theme_classic()
+```
+
+Using this plot we can decide on a power parameter. 
+WGCNA's authors recommend using a `power` that has an signed $R^2$ above `0.80`, otherwise they warn your results may be too noisy to be meaningful. 
+
+If you have multiple power values with signed $R^2$ above `0.80`, then picking the one at an inflection point.
+
+## Run WGCNA!
+```{r}
+
+bwnet <- blockwiseModules(normalized_counts,
+  maxBlockSize = 5000, # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = 5, # soft threshold for network construction
+  numericLabels = TRUE, # Let's use numbers instead of colors for module labels
+  randomSeed = 1234, # there's some randomness associated with this calculation
+  # so we should set a seed
+)
+
+# Save
+readr::write_rds(bwnet, "CMCdata_wgcna_results_without.Multiracial.group.RDS") # since it takes so much time/ consumes a lot of RAM to produce bwnet files, it's a good idea to save it and so,if necessary, you can return to this file later
+
+```
+
+## Explore the WGCNA results
+```{r}
+
+# In `bwnet` we have a data frame of eigengene module data for each sample in the `MEs` slot. 
+module_eigengenes <- bwnet$MEs
+
+# Print out a preview
+head(module_eigengenes)
+
+```
+
+## Which modules have biggest differences across treatment groups?
+
+We can also see if our eigengenes relate to our metadata labels. 
+```{r}
+# step 1: double check if our samples are still in order
+all.equal(metadata$SampleID, rownames(module_eigengenes))
+
+
+# step 2: Create the design matrix from the `diagnosis' and 'Ethnicity` variable
+des_mat1 <- model.matrix(~ metadata$Dx)
+des_mat2 <- model.matrix(~ metadata$Ethnicity)
+
+
+# step 3: Run linear model on each module
+library(limma) # lmFit() needs a transposed version of the matrix
+fit1 <- limma::lmFit(t(module_eigengenes), design = des_mat1)
+fit2 <- limma::lmFit(t(module_eigengenes), design = des_mat2)
+
+
+# step 4: Apply empirical Bayes to smooth standard errors
+fit1 <- limma::eBayes(fit1)
+fit2 <- limma::eBayes(fit2)
+
+# step 5: Apply multiple testing correction and obtain stats
+## for Diagnosis
+stats_df1 <- limma::topTable(fit1, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+## For Ethnicity
+stats_df2 <- limma::topTable(fit2, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+# step 6: Save
+write.csv(stats_df1, "stats_df_for_Diagnosis_subsetted.data.csv")
+write.csv(stats_df2, "stats_df_for_Ethnicity_subsetted.data.csv")
+
+```
+
+Let's take a look at the results. 
+They are sorted with the most significant results at the top.
+
+```{r}
+
+head(stats_df1) # matrix[6 * 7], ME2, 6, 23 being the most significant ones 
+
+head(stats_df2) # matrix[6 * 8], ME1, 10, 43 being the most significant ones
+
+```
+
+## Visualize the significant modules
+
+### Step 1) set up the module eigengene with the sample metadata labels
+```{r}
+
+# Based on diagnosis  (ME2 has 932 genes,which is bad for the heatmap)
+module_2_df <- module_eigengenes %>%
+  tibble::rownames_to_column("IndividualID") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(SampleID, Ethnicity, Institution, Dx),
+  by = c("IndividualID" = "SampleID"))
+
+# Based on Ethnicity
+module_1_df <- module_eigengenes %>%
+  tibble::rownames_to_column("IndividualID") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(SampleID, Ethnicity, Institution, Dx),
+  by = c("IndividualID" = "SampleID"))
+```
+
+### Step 2) Plot
+```{r}
+
+ggplot(
+  module_2_df,
+  aes(
+    x = Dx,  # you may use other variables (e.g., Ethnicity for x axis)
+    y = ME2,
+    color = Dx)) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.4, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.1, alpha=0.2) +
+  facet_wrap(vars(Institution))+  # use facet_wrap to check for inter-institution variations
+  theme_bw()+
+  theme(axis.text.x = element_text(face = "bold.italic", size=10),
+        axis.text.y = element_text(face = "bold", size=10),
+        axis.title = element_text(face = "bold", size=10))
+  
+```
+
+## What genes are a part of each module?
+```{r}
+
+gene_module_key <- tibble::enframe(bwnet$colors, name = "gene", value = "module") %>%
+  # Let's add the `ME` part so its more clear what these numbers are and it matches elsewhere
+  dplyr::mutate(module = paste0("ME", module))
+
+## Now we can find what genes are a part of module 2
+ME2 <- gene_module_key %>%
+  dplyr::filter(module == "ME2") 
+
+```
+
+## Let's save this gene to module key to a CSV file
+```{r}
+write.csv(gene_module_key, "CMC_wgcna_gene_to_module.csv")
+
+write.csv(ME2, "CMCdata_wgcna_gene_to_module-ME2.csv")
+
+```
+
+## Make a custom heatmap function (if the number of genes in a module is not huge!)
+```{r}
+library(tidyverse)
+make_module_heatmap <- function(module_name,
+                                expression_mat = normalized_counts,
+                                metadata_df = metadata,
+                                gene_module_key_df = gene_module_key,
+                                module_eigengenes_df = module_eigengenes) {
+  # Create a summary heatmap of a given module.
+  #
+  # Args:
+  # module_name: a character indicating what module should be plotted, e.g. "ME19"
+  # expression_mat: The full gene expression matrix. Default is `normalized_counts`.
+  # metadata_df: a data frame with refinebio_accession_code and time_point
+  #              as columns. Default is `metadata`.
+  # gene_module_key: a data.frame indicating what genes are a part of what modules. Default is `gene_module_key`.
+  # module_eigengenes: a sample x eigengene data.frame with samples as row names. Default is `module_eigengenes`.
+  #
+  # Returns:
+  # A heatmap of expression matrix for a module's genes, with a barplot of the
+  # eigengene expression for that module.
+
+  # Set up the module eigengene with its refinebio_accession_code
+  module_eigengene <- module_eigengenes_df %>%
+    dplyr::select(all_of(module_name)) %>%
+    tibble::rownames_to_column("SampleID")
+  
+  # Set up column annotation from metadata
+  col_annot_df <- metadata_df %>%
+    # Only select the treatment and sample ID columns
+    dplyr::select(SampleID, Dx, Ethnicity, Cohort, Institution) %>%
+    # Add on the eigengene expression by joining with sample IDs
+    dplyr::inner_join(module_eigengene, by = "SampleID") %>%
+    # Arrange by patient and time point
+    dplyr::arrange(Dx) %>%
+    # Store sample
+    tibble::column_to_rownames("SampleID")
+  
+  
+  # Create the ComplexHeatmap column annotation object
+  col_annot <- ComplexHeatmap::HeatmapAnnotation(
+    # Supply treatment labels
+    Dx = col_annot_df$Dx,
+    # Supply treatment labels
+    Ethicity = col_annot_df$Ethnicity,
+    #Add cohort
+    Institution= col_annot_df$Institution,
+    # Add annotation barplot
+    module_eigengene = ComplexHeatmap::anno_barplot(dplyr::select(col_annot_df, module_name)),
+    # Pick colors for each experimental group in time_point
+    col = list(Dx = c("Control" = "#f1a340", "SCZ" = "#998ec3", "BP"= "#FF6D00"))
+  )
+
+  # Get a vector of the Ensembl gene IDs that correspond to this module
+  module_genes <- gene_module_key_df %>%
+    dplyr::filter(module == module_name) %>%
+    dplyr::pull(gene)
+
+  # Set up the gene expression data frame
+  mod_mat <- expression_mat %>%
+    t() %>%
+    as.data.frame() %>%
+    # Only keep genes from this module
+    dplyr::filter(rownames(.) %in% module_genes) %>%
+    # Order the samples to match col_annot_df
+    dplyr::select(rownames(col_annot_df)) %>%
+    # Data needs to be a matrix
+    as.matrix()
+
+  # Normalize the gene expression values
+  mod_mat <- mod_mat %>%
+    # Scale can work on matrices, but it does it by column so we will need to
+    # transpose first
+    t() %>%
+    scale() %>%
+    # And now we need to transpose back
+    t()
+
+  # Create a color function based on standardized scale
+  color_func <- circlize::colorRamp2(
+    c(-2, 0, 2),
+    c("#67a9cf", "#f7f7f7", "#ef8a62")
+  )
+
+  # Plot on a heatmap
+  heatmap <- ComplexHeatmap::Heatmap(mod_mat,
+    name = module_name,
+    # Supply color function
+    col = color_func,
+    # Supply column annotation
+    bottom_annotation = col_annot,
+    # We don't want to cluster samples
+    cluster_columns = FALSE,
+    # We don't need to show sample or gene labels
+    show_row_names = FALSE,
+    show_column_names = FALSE
+  )
+
+  # Return heatmap
+  return(heatmap)
+}
+```
+
+## Make module heatmaps
+```{r}
+
+mod_2_heatmap <- make_module_heatmap(module_name = "ME2")
+
+# Print out the plot
+mod_2_heatmap
+
+```
+
+## Reference
+```{r}
+https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html 
+
+```
+
